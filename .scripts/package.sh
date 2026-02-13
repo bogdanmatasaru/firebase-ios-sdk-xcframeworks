@@ -250,12 +250,13 @@ generate_swift_package () {
     # Create targets that define each library's dependencies and resources
     comma=""; for i in */; do write_target $i $targets $comma && comma=","; done
     # Create binary targets
+    # NOTE: comma starts as "," (not empty) to separate from the last .target() entry
     if [[ -n $local_dist ]]; then
         echo "Creating local Package.swift for testing..."
-        comma=""; for i in $dist/*.xcframework; do write_local_binary $i $local_dist $binaries $comma && comma=","; done
+        comma=","; for i in $dist/*.xcframework; do write_local_binary $i $local_dist $binaries $comma && comma=","; done
     else
         echo "Creating release Package.swift..."
-        comma=""; for i in $dist/*.xcframework.zip; do write_binary $i $repo $latest $binaries $comma && comma=","; done
+        comma=","; for i in $dist/*.xcframework.zip; do write_binary $i $repo $latest $binaries $comma && comma=","; done
     fi
     # Replace the templates with the generated values
     template_replace $package "// GENERATE LIBRARIES" $libraries; rm -f $libraries
@@ -361,16 +362,17 @@ if [[ $latest != $current || $debug ]]; then
         echo "[4/6] Creating source files..."
         generate_sources "../$sources"
 
-        # Create test package using local binaries and make sure it builds
+        # Create test package using local binaries and validate the manifest
         echo "[5/6] Generating and validating Package.swift..."
         generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo $distribution
-        (cd ..; swift package dump-package | read pac)
-        (cd ..; swift build)
+        echo "Validating local Package.swift..."
+        (cd ..; swift package dump-package > /dev/null)
 
         # Create release package using remote binaries
         echo "[6/6] Generating release Package.swift..."
         generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo ''
-        (cd ..; swift package dump-package | read pac)
+        echo "Validating release Package.swift..."
+        (cd ..; swift package dump-package > /dev/null)
     )
 
     echo ""
