@@ -402,10 +402,11 @@ if [[ $latest != $current || $debug ]]; then
     fi
 
     echo "Creating GitHub release with xcframework assets..."
-    echo "Release $latest" | gh release create \
-        --target "release/$latest" \
+    gh release create "$latest" \
+        --target "main" \
         --title "Release $latest" \
-        $latest $scratch/dist/*.xcframework.zip
+        --notes "Firebase iOS SDK $latest — pre-built XCFrameworks from official Google release." \
+        $scratch/dist/*.xcframework.zip
 
     echo ""
     echo "======================================================================"
