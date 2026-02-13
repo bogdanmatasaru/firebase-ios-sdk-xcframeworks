@@ -1,18 +1,29 @@
 name: Publish Release
 
 # Runs daily at midnight UTC to check for new Firebase releases.
-# Can also be triggered manually from the Actions tab.
+# Can also be triggered manually with an optional version override.
 on:
   workflow_dispatch:
+    inputs:
+      firebase_version:
+        description: "Force specific Firebase version (leave empty for latest stable)"
+        required: false
+        type: string
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
+
+# Prevent overlapping runs (e.g. manual trigger during scheduled run)
+concurrency:
+  group: firebase-release
+  cancel-in-progress: true
 
 jobs:
-  build:
+  package:
     runs-on: macos-latest
+    timeout-minutes: 60
     permissions:
       contents: write
-      pull-requests: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,5 +31,24 @@ jobs:
       - name: Authorize GitHub CLI
         run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
 
+      - name: Cache Swift PM
+        uses: actions/cache@v4
+        with:
+          path: ~/.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          restore-keys: swiftpm-${{ runner.os }}-
+
       - name: Check for new Firebase release and publish
+        env:
+          FIREBASE_VERSION: ${{ github.event.inputs.firebase_version }}
         run: cd .scripts && sh ./package.sh
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### Firebase XCFrameworks Published" >> $GITHUB_STEP_SUMMARY
+          LATEST=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          ASSETS=$(gh release view "$LATEST" --json assets --jq '.assets | length')
+          echo "- **Version:** $LATEST" >> $GITHUB_STEP_SUMMARY
+          echo "- **Assets:** $ASSETS xcframeworks" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source:** [firebase-ios-sdk $LATEST](https://github.com/firebase/firebase-ios-sdk/releases/tag/$LATEST)" >> $GITHUB_STEP_SUMMARY

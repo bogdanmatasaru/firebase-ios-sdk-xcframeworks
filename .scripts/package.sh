@@ -1,418 +1,487 @@
 #!/bin/bash
-
 # ══════════════════════════════════════════════════════════════════════════════
-# Firebase iOS SDK XCFrameworks — Automated packaging script
+# Firebase iOS SDK XCFrameworks — Automated Packaging Script
 #
-# This script mirrors the official Firebase iOS SDK releases as pre-built
-# XCFrameworks distributed via Swift Package Manager binary targets.
+# Mirrors official Firebase iOS SDK releases as pre-built XCFrameworks
+# distributed via Swift Package Manager binary targets.
 #
-# How it works:
-#   1. Checks if a new Firebase release exists (compares upstream vs local)
-#   2. Downloads the official Firebase.zip from Google's GitHub release
-#   3. Extracts and repackages each .xcframework individually
-#   4. Generates Package.swift with binaryTarget entries + SHA256 checksums
-#   5. Creates a GitHub release with all .xcframework.zip assets
+# Flow:
+#   1. Compare upstream Firebase version with latest local release
+#   2. Download official Firebase.zip from Google's GitHub release
+#   3. Extract & repackage each .xcframework individually (with _ prefix)
+#   4. Generate Package.swift with binaryTarget entries + SHA256 checksums
+#   5. Create a tagged GitHub release with all .xcframework.zip assets
+#   6. Verify the release asset count matches expectations
 #
 # The XCFrameworks are NEVER compiled — they come directly from Google's
 # official release artifacts. This script only repackages them for SPM.
 #
 # Usage:
-#   cd .scripts && sh package.sh                    # Full release
-#   cd .scripts && sh package.sh debug              # Debug mode (opens temp dir)
-#   cd .scripts && sh package.sh debug skip-release # Generate locally, don't push
+#   cd .scripts && sh package.sh                    # Full automated release
+#   cd .scripts && sh package.sh debug              # Debug (opens temp dir)
+#   cd .scripts && sh package.sh debug skip-release # Generate locally only
+#
+# Environment:
+#   FIREBASE_VERSION  — Force a specific version (skips latest check)
 # ══════════════════════════════════════════════════════════════════════════════
 
-latest_release_number () {
-    # Github cli to get the latest release
-    gh release list --repo $1 --limit 1 |
-    # Regex to find the version number, assumes semantic versioning
-    grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' |
-    # Take the first match in the regex
-    head -1 || echo '0.0.0'
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────────────
+
+readonly FIREBASE_REPO="https://github.com/firebase/firebase-ios-sdk"
+readonly XCFRAMEWORKS_REPO="https://github.com/bogdanmatasaru/firebase-ios-sdk-xcframeworks"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Logging ───────────────────────────────────────────────────────────────
+
+log()   { echo "[INFO]  $*"; }
+warn()  { echo "[WARN]  $*" >&2; }
+error() { echo "[ERROR] $*" >&2; exit 1; }
+step()  { echo ""; echo "[$1/$TOTAL_STEPS] $2"; }
+
+TOTAL_STEPS=6
+
+# ── Helper Functions ──────────────────────────────────────────────────────
+
+latest_stable_release() {
+    # Get the latest NON-pre-release version from a GitHub repo.
+    # Uses --exclude-pre-releases to avoid betas/RCs.
+    gh release list --repo "$1" --exclude-pre-releases --limit 1 \
+        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -1 || echo "0.0.0"
 }
 
-xcframework_name () {
-    # Filter out path and extension to get the framework name
-    # Ex. xcframework_name "FirebaseFirestore/leveldb-library.xcframework" = "leveldb-library"
-    echo $1 | sed -E 's/.*\/|\.xcframework|\.xcframework\.zip//g'
+xcframework_name() {
+    # Extract framework name from path.
+    # e.g. "FirebaseFirestore/leveldb-library.xcframework" → "leveldb-library"
+    echo "$1" | sed -E 's/.*\/|\.xcframework(\.zip)?//g'
 }
 
-resource_name () {
-    # Filter out path to get the file name
-    echo $1 | sed -E 's/.*\///g'
+library_name() {
+    # Extract library folder name from path.
+    # e.g. "FirebaseAnalytics/FirebaseInstallations.xcframework" → "FirebaseAnalytics"
+    echo "$1" | sed -E 's/\/.*//g'
 }
 
-library_name () {
-    # Filter out path to get the folder name
-    # Ex. library_name "FirebaseAnalytics/FirebaseInstallations.xcframework" = "FirebaseAnalytics"
-    echo $1 | sed -E 's/\/|\/.*\.xcframework|\/.*\.xcframework\.zip//g'
+non_xcframework_files() {
+    # Return files that are NOT xcframeworks (resources, plists, etc.)
+    echo "$1" | grep -v -E "\.xcframework"
 }
 
-excludes () {
-    # Files other than xcframeworks will not be included in the package
-    echo "$1" | grep -v -E ".xcframework"
+trim_empty_lines() {
+    sed -i '' '/^$/d' "$1"
 }
 
-trim_empty_lines () {
-    # Delete all empty lines in a file
-    sed -i '' '/^$/d' $1
+template_replace() {
+    local file_content
+    file_content=$(cat "$1")
+    trim_empty_lines "$3"
+    local replacement
+    replacement=$(cat "$3")
+    # Replace placeholder with generated content
+    local result="${file_content//"$2"/"$replacement"}"
+    printf "%s" "$result" > "$1"
 }
 
-template_replace () {
-    local file=$(cat $1)
-    # Replace the template with the contents of the replacement file
-    local result=${file//"$2"/"$(trim_empty_lines $3; cat $3)"}
-    # Write the result back to the original file
-    rm -f $1; touch $1; printf "$result" >> $1
+# ── Scratch Directory ─────────────────────────────────────────────────────
+
+create_scratch() {
+    scratch=$(mktemp -d -t FirebasePackaging)
+    if [[ ${debug:-} ]]; then open "$scratch"; fi
+    trap 'if [[ ${debug:-} ]]; then read -r -p "Press enter to clean up..."; fi; rm -rf "$scratch"' EXIT
 }
 
-create_scratch () {
-    # Create temporary directory
-    scratch=$(mktemp -d -t TemporaryDirectory)
-    if [[ $debug ]]; then open $scratch; fi
-    # Run cleanup on exit
-    trap "if [[ \$debug ]]; then read -p \"\"; fi; rm -rf \"$scratch\"" EXIT
-}
+# ── Framework Processing ─────────────────────────────────────────────────
 
-rename_frameworks () {
+rename_frameworks_with_prefix() {
     local prefix="$1"
-    for i in */*.xcframework; do (
-        local name=$(xcframework_name $i)
-        cd "$i/../"; mv "$name.xcframework" "$prefix$name.xcframework"
-    ) & done;
+    for framework in */*.xcframework; do (
+        local name
+        name=$(xcframework_name "$framework")
+        cd "$framework/../"
+        mv "$name.xcframework" "${prefix}${name}.xcframework"
+    ) & done
     wait
 }
 
-zip_frameworks () {
-    for i in */*.xcframework; do (
-        local name=$(xcframework_name $i)
-        # Preserve symlinks using the -y option
-        cd "$i/../"; zip -ryqo "$name.xcframework.zip" "$name.xcframework"
-    ) & done;
+zip_frameworks() {
+    for framework in */*.xcframework; do (
+        local name
+        name=$(xcframework_name "$framework")
+        cd "$framework/../"
+        # -y preserves symlinks, -q quiet, -o update only
+        zip -ryqo "$name.xcframework.zip" "$name.xcframework"
+    ) & done
     wait
 }
 
-prepare_files_for_distribution () {
+prepare_distribution() {
     local dist="$1"
-    # Create the distribution folder
-    mkdir $dist
-    # Copy unzipped frameworks for testing (Package.swift using local binaries)
-    for i in */*.xcframework; do cp -rf $i $dist; done
-    # Copy zipped frameworks for release (these will be uploaded to remote)
-    for i in */*.xcframework.zip; do cp -f $i $dist; done
+    mkdir -p "$dist"
+    # Unzipped frameworks (for local Package.swift testing)
+    for framework in */*.xcframework; do cp -rf "$framework" "$dist"; done
+    # Zipped frameworks (for GitHub release upload)
+    for archive in */*.xcframework.zip; do cp -f "$archive" "$dist"; done
 }
 
-generate_sources () {
+# ── Source Generation ─────────────────────────────────────────────────────
+
+generate_sources() {
     local sources="$1"
-    # Create the sources folder
-    mkdir $sources
-    # Create the sources for the umbrella header and modulemap
-    mkdir "$sources/Firebase"
-    cp -f "Firebase.h" "$sources/Firebase"
-    cp -f "module.modulemap" "$sources/Firebase"
-    touch "$sources/Firebase/dummy.m" # SPM requires at least one source file
-    # Create a source folder for each library target
-    for i in */; do
-        local name="$(library_name $i)";
-        mkdir "$sources/${name}"
-        touch "$sources/$name/dummy.swift" # SPM requires at least one source file
-        # Copy resources for the target to the source folder
-        if [ -d "$i/Resources" ]; then
-            cp -rf "$i/Resources" "$sources/$name"
+    mkdir -p "$sources/Firebase"
+
+    # Umbrella header and modulemap (from the official Firebase.zip)
+    cp -f "Firebase.h" "$sources/Firebase/"
+    cp -f "module.modulemap" "$sources/Firebase/"
+    touch "$sources/Firebase/dummy.m"  # SPM requires at least one source file
+
+    # Per-library source directories with dummy files
+    for lib_dir in */; do
+        local name
+        name=$(library_name "$lib_dir")
+        mkdir -p "$sources/$name"
+        touch "$sources/$name/dummy.swift"
+
+        # Copy resources if present
+        if [[ -d "$lib_dir/Resources" ]]; then
+            cp -rf "$lib_dir/Resources" "$sources/$name/"
         fi
-        # Copy any non-resource/non-xcframework files
-        for f in ${i}*; do if [[ $(excludes $f) ]]; then
-            if [[ -d $f ]]; then
-                cp -rf $f "$sources/$name"
-            else
-                cp -f $f "$sources/$name"
+
+        # Copy non-xcframework files (plists, configs, etc.)
+        for file in "${lib_dir}"*; do
+            if [[ $(non_xcframework_files "$file") ]]; then
+                if [[ -d "$file" ]]; then
+                    cp -rf "$file" "$sources/$name/"
+                else
+                    cp -f "$file" "$sources/$name/"
+                fi
             fi
-        fi; done;
-    done;
+        done
+    done
 }
 
-write_library () {
-    local library=$(library_name $1)
-    local output="$2"
-    local comma="$3"
+# ── Package.swift Generation ─────────────────────────────────────────────
 
-    touch $output
-    printf "$comma
-        .library(
-            name: \"$library\",
-            targets: [\"${library}Target\"]
-        )" >> $output
-}
+detect_platforms() {
+    # Detect which platforms an xcframework supports.
+    # Returns a conditional dependency string if not all platforms are supported.
+    local name
+    name=$(xcframework_name "$1")
 
-conditional_dependency () {
-    local name=$(xcframework_name "$1")
-    local output="$2"
-    # Check xcframework folder for platform specific architectures
-    local ios=$(ls "$name.xcframework" | grep "ios-" >/dev/null && echo ".iOS")
-    local tvos=$(ls "$name.xcframework" | grep "tvos-" >/dev/null && echo ".tvOS")
-    local macos=$(ls "$name.xcframework" | grep "macos-" >/dev/null && echo ".macOS")
-    # Get array of platforms
-    local platforms=($ios $tvos $macos)
-    # Join platforms with comma and space separation
-    local joined=$( echo ${platforms[*]} | sed 's/ /, /g' )
-    if [ "$joined" == ".iOS, .tvOS, .macOS" ]; then
-        # Supports all platforms, conditional not needed
+    local platforms=()
+    ls "$name.xcframework" | grep -q "ios-"     && platforms+=(".iOS")
+    ls "$name.xcframework" | grep -q "tvos-"    && platforms+=(".tvOS")
+    ls "$name.xcframework" | grep -q "macos-"   && platforms+=(".macOS")
+    ls "$name.xcframework" | grep -q "watchos-"  && platforms+=(".watchOS")
+    ls "$name.xcframework" | grep -q "xros-"    && platforms+=(".visionOS")
+
+    local joined
+    joined=$(IFS=", "; echo "${platforms[*]}")
+
+    if [[ "$joined" == ".iOS, .tvOS, .macOS" || "$joined" == ".iOS, .tvOS, .macOS, .watchOS, .visionOS" ]]; then
+        # Supports all major platforms — no condition needed
         echo "\"$name\""
     else
-        # Create conditional dependency from target and platforms
         echo ".target(name: \"$name\", condition: .when(platforms: [$joined]))"
     fi
 }
 
-write_target () {
-    local library=$(library_name $1)
-    local output=$2
-    local comma=$3
+write_library() {
+    local library
+    library=$(library_name "$1")
+    local output="$2"
+    local comma="${3:-}"
+
+    printf "%s\n        .library(\n            name: \"%s\",\n            targets: [\"%sTarget\"]\n        )" \
+        "$comma" "$library" "$library" >> "$output"
+}
+
+write_target() {
+    local library
+    library=$(library_name "$1")
+    local output="$2"
+    local comma="${3:-}"
     local target="${library}Target"
-    local dependencies=$(ls -1A $library | grep .xcframework.zip)
-    local excludes=$(excludes "$(ls -1A $library)")
+    local dependencies
+    dependencies=$(ls -1A "$library" | grep ".xcframework.zip" || true)
+    local excludes
+    excludes=$(non_xcframework_files "$(ls -1A "$library")" || true)
 
-    touch $output
-    printf "$comma
-        .target(
-            name: \"$target\",
-            dependencies: [
-                \"Firebase\"" >> $output
-    # All targets depend on the core FirebaseAnalytics binaries
-    if [ $target != "FirebaseAnalyticsTarget" ]; then printf ",
-                \"FirebaseAnalyticsTarget\"" >> $output
+    printf "%s\n        .target(\n            name: \"%s\",\n            dependencies: [\n                \"Firebase\"" \
+        "$comma" "$target" >> "$output"
+
+    # All targets depend on FirebaseAnalytics core binaries
+    if [[ "$target" != "FirebaseAnalyticsTarget" ]]; then
+        printf ",\n                \"FirebaseAnalyticsTarget\"" >> "$output"
     fi
-    # Library specific dependencies are expected to be inside the $library folder
-    echo "$dependencies" | while read -r dependency; do printf ",
-                $(cd $library; conditional_dependency $dependency)" >> $output
-    done; printf "\n            ]" >> $output;
-    # Path
-    printf ",\n            path: \"Sources/$library\"" >> $output
-    # Non-resource, non-xcframework files
-    if [[ $excludes ]]; then
-        printf ",\n            exclude: [" >> $output
-        comma=""; echo "$excludes" | while read -r exclude; do printf "$comma
-                \"$exclude\"" >> $output; comma=",";
-        done; printf "\n            ]" >> $output;
+
+    # Library-specific xcframework dependencies
+    if [[ -n "$dependencies" ]]; then
+        echo "$dependencies" | while read -r dep; do
+            printf ",\n                %s" "$(cd "$library"; detect_platforms "$dep")" >> "$output"
+        done
     fi
-    # Closing bracket
-    printf "\n        )" >> $output
+    printf "\n            ]" >> "$output"
+
+    # Source path
+    printf ",\n            path: \"Sources/%s\"" "$library" >> "$output"
+
+    # Excluded non-xcframework files
+    if [[ -n "$excludes" ]]; then
+        printf ",\n            exclude: [" >> "$output"
+        local exc_comma=""
+        echo "$excludes" | while read -r exc; do
+            printf "%s\n                \"%s\"" "$exc_comma" "$exc" >> "$output"
+            exc_comma=","
+        done
+        printf "\n            ]" >> "$output"
+    fi
+
+    printf "\n        )" >> "$output"
 }
 
-write_binary () {
-    local file=$1
-    local repo=$2
-    local version=$3
-    local output=$4
-    local comma=$5
+write_binary_target() {
+    local file="$1"
+    local repo="$2"
+    local version="$3"
+    local output="$4"
+    local comma="${5:-}"
 
-    # Get the checksum
-    touch Package.swift # checksum command requires a package file
-    local checksum=$(swift package compute-checksum "$file")
-    local name=$(xcframework_name $file)
+    touch Package.swift  # checksum command requires a package manifest
+    local checksum
+    checksum=$(swift package compute-checksum "$file")
+    local name
+    name=$(xcframework_name "$file")
 
-    touch $output
-    printf "$comma
-        .binaryTarget(
-            name: \"$name\",
-            url: \"$repo/releases/download/$version/$name.xcframework.zip\",
-            checksum: \"$checksum\"
-        )" >> $output
+    printf "%s\n        .binaryTarget(\n            name: \"%s\",\n            url: \"%s/releases/download/%s/%s.xcframework.zip\",\n            checksum: \"%s\"\n        )" \
+        "$comma" "$name" "$repo" "$version" "$name" "$checksum" >> "$output"
 }
 
-write_local_binary () {
-    local name=$(xcframework_name "$1")
-    local dist=$2
-    local output=$3
-    local comma=$4
+write_local_binary_target() {
+    local name
+    name=$(xcframework_name "$1")
+    local dist="$2"
+    local output="$3"
+    local comma="${4:-}"
 
-    touch $output
-    printf "$comma
-        .binaryTarget(
-            name: \"$name\",
-            path: \"$dist/$name.xcframework\"
-        )" >> $output
+    printf "%s\n        .binaryTarget(\n            name: \"%s\",\n            path: \"%s/%s.xcframework\"\n        )" \
+        "$comma" "$name" "$dist" "$name" >> "$output"
 }
 
-generate_swift_package () {
+generate_swift_package() {
     local package="$1"
     local template="$2"
     local dist="$3"
     local repo="$4"
-    local local_dist="$5"
-    local libraries="libraries.txt"
-    local targets="targets.txt"
-    local binaries="binaries.txt"
-    # Create package file
-    cp -f $template $package
-    # Create libraries
-    comma=""; for i in */; do write_library $i $libraries $comma && comma=","; done
-    # Create targets that define each library's dependencies and resources
-    comma=""; for i in */; do write_target $i $targets $comma && comma=","; done
-    # Create binary targets
-    # NOTE: comma starts as "," (not empty) to separate from the last .target() entry
-    if [[ -n $local_dist ]]; then
-        echo "Creating local Package.swift for testing..."
-        comma=","; for i in $dist/*.xcframework; do write_local_binary $i $local_dist $binaries $comma && comma=","; done
-    else
-        echo "Creating release Package.swift..."
-        comma=","; for i in $dist/*.xcframework.zip; do write_binary $i $repo $latest $binaries $comma && comma=","; done
-    fi
-    # Replace the templates with the generated values
-    template_replace $package "// GENERATE LIBRARIES" $libraries; rm -f $libraries
-    template_replace $package "// GENERATE TARGETS" $targets; rm -f $targets
-    template_replace $package "// GENERATE BINARIES" $binaries; rm -f $binaries
-}
+    local local_dist="${5:-}"
+    local libraries_file="libraries.txt"
+    local targets_file="targets.txt"
+    local binaries_file="binaries.txt"
 
-find_and_extract_firebase_zip() {
-    echo "Looking for downloaded Firebase zip..."
+    cp -f "$template" "$package"
 
-    # Find the zip file and ensure it's called Firebase.zip
-    zip_file=$(find . -name "*.zip" | head -n 1)
+    # Generate library products
+    local comma=""
+    for lib_dir in */; do
+        write_library "$lib_dir" "$libraries_file" "$comma"
+        comma=","
+    done
 
-    if [ -n "$zip_file" ]; then
-        echo "Found downloaded zip file: $zip_file"
-        mv "$zip_file" "Firebase.zip"
-        unzip -q Firebase.zip
-    else
-        echo "No downloaded zip file found in root directory. Exiting."
-        exit 1
-    fi
+    # Generate target definitions
+    comma=""
+    for lib_dir in */; do
+        write_target "$lib_dir" "$targets_file" "$comma"
+        comma=","
+    done
 
-    # If there's no Firebase folder at the root, look for a relevant zip file and unzip it
-    if [ ! -d "Firebase" ]; then
-        echo "Firebase directory not found in root. Looking for zip file in subdirectories..."
-        for dir in */; do
-            if [ -d "$dir" ] && [ "$dir" != "carthage/" ]; then
-                firebase_zip=$(find "$dir" -name "Firebase*.zip" | head -n 1)
-                if [ -n "$firebase_zip" ]; then
-                    echo "Found Firebase zip in $dir: $firebase_zip"
-                    unzip -q "$firebase_zip"
-                    break
-                fi
-            fi
+    # Generate binary targets
+    # NOTE: comma starts as "," to separate from the last .target() entry above
+    if [[ -n "$local_dist" ]]; then
+        log "Generating local Package.swift for testing..."
+        comma=","
+        for framework in "$dist"/*.xcframework; do
+            write_local_binary_target "$framework" "$local_dist" "$binaries_file" "$comma"
+            comma=","
         done
-        if [ ! -d "Firebase" ]; then
-            echo "Firebase directory not found in any subdirectory. Exiting."
-            exit 1
-        fi
+    else
+        log "Generating release Package.swift..."
+        comma=","
+        for archive in "$dist"/*.xcframework.zip; do
+            write_binary_target "$archive" "$repo" "$latest" "$binaries_file" "$comma"
+            comma=","
+        done
     fi
 
-    echo "Firebase zip found and extracted successfully"
+    # Replace template placeholders with generated content
+    template_replace "$package" "// GENERATE LIBRARIES" "$libraries_file"; rm -f "$libraries_file"
+    template_replace "$package" "// GENERATE TARGETS" "$targets_file"; rm -f "$targets_file"
+    template_replace "$package" "// GENERATE BINARIES" "$binaries_file"; rm -f "$binaries_file"
 }
 
-commit_changes() {
-    local version=$1
+# ── Git & Release ─────────────────────────────────────────────────────────
+
+commit_and_push() {
+    local version="$1"
     git add .
-    git commit -m "Updated Package.swift and sources for Firebase $version"
+    git commit -m "Release $version — updated Package.swift and sources"
     git push origin main
 }
 
-# Exit when any command fails
-set -e
-set -o pipefail
+create_github_release() {
+    local version="$1"
+    local assets_dir="$2"
 
-# ── Repos ─────────────────────────────────────────────────────────────────
-firebase_repo="https://github.com/firebase/firebase-ios-sdk"
-xcframeworks_repo="https://github.com/bogdanmatasaru/firebase-ios-sdk-xcframeworks"
+    # Create tag if it doesn't exist
+    if git rev-parse "$version" >/dev/null 2>&1; then
+        warn "Tag $version already exists, skipping tag creation."
+    else
+        log "Creating tag $version..."
+        git tag "$version"
+        git push origin "$version"
+    fi
 
-# ── Release versions ──────────────────────────────────────────────────────
-latest=$(latest_release_number $firebase_repo)
-current=$(latest_release_number $xcframeworks_repo)
+    log "Creating GitHub release with xcframework assets..."
+    gh release create "$version" \
+        --target "main" \
+        --title "Firebase iOS SDK $version" \
+        --notes "Pre-built XCFrameworks from the official Firebase iOS SDK $version release.
 
-# ── Args ──────────────────────────────────────────────────────────────────
-debug=$(echo $@ || "" | grep debug)
-skip_release=$(echo $@ || "" | grep skip-release)
+**Source:** [firebase/firebase-ios-sdk $version](https://github.com/firebase/firebase-ios-sdk/releases/tag/$version)
+**Release notes:** [Firebase iOS Release Notes](https://firebase.google.com/support/release-notes/ios)" \
+        "$assets_dir"/*.xcframework.zip
+}
+
+verify_release_assets() {
+    local version="$1"
+    local expected_dir="$2"
+
+    local expected
+    expected=$(find "$expected_dir" -name "*.xcframework.zip" | wc -l | tr -d ' ')
+    local actual
+    actual=$(gh release view "$version" --json assets --jq '.assets | length')
+
+    if [[ "$expected" -ne "$actual" ]]; then
+        error "Asset count mismatch: expected $expected, got $actual. Release may be incomplete."
+    fi
+    log "Release verified: $actual assets uploaded successfully."
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════
+
+# Parse arguments
+debug=$(echo "${*:-}" | grep -o "debug" || true)
+skip_release=$(echo "${*:-}" | grep -o "skip-release" || true)
+
+# Determine versions
+if [[ -n "${FIREBASE_VERSION:-}" ]]; then
+    latest="$FIREBASE_VERSION"
+    log "Using forced version: $latest"
+else
+    latest=$(latest_stable_release "$FIREBASE_REPO")
+fi
+current=$(latest_stable_release "$XCFRAMEWORKS_REPO")
 
 echo "======================================================================"
 echo "  Firebase XCFrameworks Packager"
 echo "======================================================================"
-echo "  Upstream (firebase/firebase-ios-sdk): $latest"
-echo "  Current (this repo):                  $current"
+echo "  Upstream (firebase-ios-sdk):  $latest"
+echo "  Current  (this repo):         $current"
 echo "======================================================================"
 
-if [[ $latest != $current || $debug ]]; then
-    echo ""
-    echo "$current is out of date. Updating to $latest..."
-    distribution="dist"
-    sources="Sources"
-    package="Package.swift"
+if [[ "$latest" == "$current" && -z "${debug:-}" ]]; then
+    log "$current is up to date. Nothing to do."
+    exit 0
+fi
 
-    # Generate files in a temporary directory
-    create_scratch
-    (
-        cd $scratch
-        home=$OLDPWD
-        echo ""
-        echo "[1/6] Downloading Firebase $latest from Google..."
-        gh release download --pattern 'Firebase.zip' --repo $firebase_repo
+log "Updating from $current → $latest..."
 
-        find_and_extract_firebase_zip
+distribution="dist"
+sources="Sources"
+package="Package.swift"
 
-        echo "[2/6] Preparing xcframeworks for distribution..."
-        cd Firebase
-        rename_frameworks "_"
-        zip_frameworks
+create_scratch
+(
+    cd "$scratch"
+    home="$OLDPWD"
 
-        echo "[3/6] Creating distribution files..."
-        prepare_files_for_distribution "../$distribution"
+    step 1 "Downloading Firebase $latest from Google..."
+    gh release download --pattern 'Firebase.zip' --repo "$FIREBASE_REPO" --clobber
 
-        echo "[4/6] Creating source files..."
-        generate_sources "../$sources"
+    # Extract the Firebase.zip
+    zip_file=$(find . -name "*.zip" -maxdepth 1 | head -1)
+    if [[ -z "$zip_file" ]]; then error "Firebase.zip download failed."; fi
+    log "Extracting $zip_file..."
+    unzip -q "$zip_file"
 
-        # Create test package using local binaries and validate the manifest
-        echo "[5/6] Generating and validating Package.swift..."
-        generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo $distribution
-        echo "Validating local Package.swift..."
-        (cd ..; swift package dump-package > /dev/null)
-
-        # Create release package using remote binaries
-        echo "[6/6] Generating release Package.swift..."
-        generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo ''
-        echo "Validating release Package.swift..."
-        (cd ..; swift package dump-package > /dev/null)
-    )
-
-    echo ""
-    echo "Moving files to repo..."
-    cd ..
-
-    # Remove any existing files
-    if [ -d $sources ]; then rm -rf "$sources"; fi
-    if [ -f $package ]; then rm -f "$package"; fi
-
-    # Move generated files into the repo directory
-    mv "$scratch/$sources" "$sources"
-    mv "$scratch/$package" "$package"
-
-    # Skips deploy
-    if [[ $skip_release ]]; then echo "Done (skip-release)."; exit 0; fi
-
-    # Deploy to repository
-    echo "Pushing changes to GitHub..."
-    commit_changes "$latest"
-
-    # Tag and release
-    if git rev-parse "$latest" >/dev/null 2>&1; then
-        echo "Tag $latest already exists. Skipping."
-    else
-        echo "Creating tag $latest..."
-        git tag "$latest"
-        git push origin "$latest"
+    # Handle nested zip structures (some releases wrap in an extra folder)
+    if [[ ! -d "Firebase" ]]; then
+        for dir in */; do
+            if [[ -d "$dir" && "$dir" != "carthage/" ]]; then
+                nested_zip=$(find "$dir" -name "Firebase*.zip" -maxdepth 1 | head -1)
+                if [[ -n "$nested_zip" ]]; then
+                    log "Found nested archive: $nested_zip"
+                    unzip -q "$nested_zip"
+                    break
+                fi
+            fi
+        done
+        [[ -d "Firebase" ]] || error "Firebase directory not found after extraction."
     fi
 
-    echo "Creating GitHub release with xcframework assets..."
-    gh release create "$latest" \
-        --target "main" \
-        --title "Release $latest" \
-        --notes "Firebase iOS SDK $latest — pre-built XCFrameworks from official Google release." \
-        $scratch/dist/*.xcframework.zip
+    step 2 "Preparing xcframeworks for distribution..."
+    cd Firebase
+    rename_frameworks_with_prefix "_"
+    zip_frameworks
 
-    echo ""
-    echo "======================================================================"
-    echo "  DONE — Release $latest published successfully"
-    echo "======================================================================"
-else
-    echo ""
-    echo "$current is up to date. Nothing to do."
+    step 3 "Creating distribution files..."
+    prepare_distribution "../$distribution"
+
+    step 4 "Generating source files..."
+    generate_sources "../$sources"
+
+    step 5 "Generating & validating Package.swift (local)..."
+    generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" "$XCFRAMEWORKS_REPO" "$distribution"
+    log "Validating local manifest..."
+    (cd ..; swift package dump-package > /dev/null)
+
+    step 6 "Generating & validating Package.swift (release)..."
+    generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" "$XCFRAMEWORKS_REPO" ""
+    log "Validating release manifest..."
+    (cd ..; swift package dump-package > /dev/null)
+)
+
+log "Moving generated files to repo..."
+cd ..
+
+# Clean existing generated files
+[[ -d "$sources" ]] && rm -rf "$sources"
+[[ -f "$package" ]] && rm -f "$package"
+
+# Move generated files into repo
+mv "$scratch/$sources" "$sources"
+mv "$scratch/$package" "$package"
+
+# Skip deploy if requested
+if [[ -n "${skip_release:-}" ]]; then
+    log "Done (skip-release mode). Files generated locally."
+    exit 0
 fi
+
+# Deploy
+log "Pushing changes to GitHub..."
+commit_and_push "$latest"
+
+log "Creating GitHub release..."
+create_github_release "$latest" "$scratch/dist"
+
+log "Verifying release..."
+verify_release_assets "$latest" "$scratch/dist"
+
+echo ""
+echo "======================================================================"
+echo "  DONE — Firebase $latest published successfully"
+echo "  Assets: $(find "$scratch/dist" -name '*.xcframework.zip' | wc -l | tr -d ' ') xcframeworks"
+echo "======================================================================"
