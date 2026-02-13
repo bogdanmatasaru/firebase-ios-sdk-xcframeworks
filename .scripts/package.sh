@@ -302,12 +302,10 @@ find_and_extract_firebase_zip() {
 }
 
 commit_changes() {
-    branch=$1
-    git checkout -b $branch
+    local version=$1
     git add .
-    git commit -m "Updated Package.swift and sources for latest firebase sdks - ${branch#release/}"
-    git push -u origin $branch
-    gh pr create --fill --body "Automated update to Firebase ${branch#release/}"
+    git commit -m "Updated Package.swift and sources for Firebase $version"
+    git push origin main
 }
 
 # Exit when any command fails
@@ -391,13 +389,14 @@ if [[ $latest != $current || $debug ]]; then
     if [[ $skip_release ]]; then echo "Done (skip-release)."; exit 0; fi
 
     # Deploy to repository
-    echo "Merging changes to GitHub..."
-    commit_changes "release/$latest"
+    echo "Pushing changes to GitHub..."
+    commit_changes "$latest"
 
     # Tag and release
     if git rev-parse "$latest" >/dev/null 2>&1; then
         echo "Tag $latest already exists. Skipping."
     else
+        echo "Creating tag $latest..."
         git tag "$latest"
         git push origin "$latest"
     fi
