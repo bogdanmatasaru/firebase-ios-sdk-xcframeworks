@@ -80,7 +80,9 @@ template_replace() {
     local replacement
     replacement=$(cat "$3")
     # Replace placeholder with generated content
-    local result="${file_content//"$2"/"$replacement"}"
+    # NOTE: outer quotes omitted — bash 3.2 (macOS) inserts literal `"`
+    # around the replacement string when the substitution is double-quoted.
+    local result=${file_content//"$2"/$replacement}
     printf "%s" "$result" > "$1"
 }
 
