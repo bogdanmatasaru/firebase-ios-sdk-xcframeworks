@@ -23,16 +23,20 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Authorize GitHub CLI
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Cache Swift PM
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.swiftpm
           key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.swift') }}
