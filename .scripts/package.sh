@@ -44,12 +44,87 @@ TOTAL_STEPS=6
 
 # ── Helper Functions ──────────────────────────────────────────────────────
 
+repo_slug() {
+    # Strip "https://github.com/" and any trailing slash → "owner/repo".
+    # Works for both the Firebase repo and this mirror.
+    echo "$1" | sed -E 's#https?://github.com/##; s#/$##'
+}
+
+# File-backed cache for Firebase's /releases response. Shared between
+# `latest_stable_release` (for upstream) and `upstream_absolute_latest` so we
+# make exactly ONE network call per script run instead of two.
+#
+# Why a file and not a shell variable? These helpers are called from command
+# substitutions — `latest=$(latest_stable_release …)` — which execute in a
+# subshell. Any globals populated inside the subshell die with it, so a plain
+# cache variable would be re-fetched every call. A tempfile survives.
+_FIREBASE_RELEASES_CACHE="${TMPDIR:-/tmp}/firebase-releases-$$.json"
+trap 'rm -f "$_FIREBASE_RELEASES_CACHE"' EXIT
+
+firebase_releases_json() {
+    # Return the cached /releases response, fetching on first call only.
+    if [[ ! -s "$_FIREBASE_RELEASES_CACHE" ]]; then
+        local slug
+        slug=$(repo_slug "$FIREBASE_REPO")
+        # per_page=30 covers ~3 years of upstream minors even in edge cases
+        # where several patches are released between minors. GitHub returns
+        # releases ordered by created_at DESC.
+        gh api "repos/$slug/releases?per_page=30" 2>/dev/null > "$_FIREBASE_RELEASES_CACHE" \
+            || echo "[]" > "$_FIREBASE_RELEASES_CACHE"
+    fi
+    cat "$_FIREBASE_RELEASES_CACHE"
+}
+
+release_has_firebase_zip() {
+    # Does a specific upstream tag ship Firebase.zip?
+    # Used by the FIREBASE_VERSION=<tag> preflight check.
+    #
+    # Note on error handling: when the tag does not exist, `gh api` exits
+    # non-zero AND writes the raw 404 JSON to stdout (weird CLI choice, but
+    # current behavior). We sanitize by taking only the last line and checking
+    # that it's a pure integer; anything else — including empty output or a
+    # stray error body — is treated as "no asset".
+    local tag="$1"
+    local slug
+    slug=$(repo_slug "$FIREBASE_REPO")
+    local count
+    count=$(gh api "repos/$slug/releases/tags/$tag" \
+        --jq '.assets | map(select(.name=="Firebase.zip")) | length' \
+        2>/dev/null | tail -n 1 || true)
+    [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]
+}
+
 latest_stable_release() {
     # Get the latest NON-pre-release version from a GitHub repo.
-    # Uses --exclude-pre-releases to avoid betas/RCs.
-    gh release list --repo "$1" --exclude-pre-releases --limit 1 \
-        | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1 || echo "0.0.0"
+    #
+    # For the upstream Firebase repo we additionally require the release to ship
+    # a Firebase.zip asset. Firebase publishes the prebuilt zip ONLY for minor
+    # releases (X.Y.0) — patch releases (X.Y.Z with Z>0) are source-only and
+    # cannot be mirrored as binaries. Without this filter the script would fail
+    # with "no assets to download" whenever a patch is the newest tag.
+    #
+    # NOTE: `gh release list --json` does not expose asset names. We use the
+    # raw REST endpoint which includes the full asset array per release.
+    local repo="$1"
+
+    if [[ "$repo" == *"firebase/firebase-ios-sdk"* ]]; then
+        firebase_releases_json | jq -r \
+            '[.[] | select(.prerelease==false and .draft==false)
+                  | select(.assets | map(.name) | index("Firebase.zip"))][0].tag_name // empty' \
+            2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0"
+    else
+        gh release list --repo "$repo" --exclude-pre-releases --limit 1 \
+            | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -1 || echo "0.0.0"
+    fi
+}
+
+upstream_absolute_latest() {
+    # Newest non-prerelease tag from upstream (may have no Firebase.zip).
+    # Used only to inform the user when we are intentionally staying behind.
+    firebase_releases_json | jq -r \
+        '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' \
+        2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo ""
 }
 
 xcframework_name() {
@@ -381,6 +456,17 @@ skip_release=$(echo "${*:-}" | grep -o "skip-release" || true)
 if [[ -n "${FIREBASE_VERSION:-}" ]]; then
     latest="$FIREBASE_VERSION"
     log "Using forced version: $latest"
+    # Preflight: refuse forced versions that upstream did not ship as a binary.
+    # Without this check, users forcing e.g. FIREBASE_VERSION=12.12.1 would
+    # hit the original "no assets to download" error from `gh release download`
+    # and spend time trying to diagnose what looks like an auth/network bug.
+    if ! release_has_firebase_zip "$latest"; then
+        error "FIREBASE_VERSION=$latest has no Firebase.zip asset on upstream.
+       Firebase publishes the prebuilt zip ONLY for minor releases (X.Y.0).
+       Patch releases (X.Y.Z with Z>0) are source-only and cannot be mirrored as binaries.
+       If you need this patch, either use the source-based firebase/firebase-ios-sdk package
+       directly, or wait for the next minor release."
+    fi
 else
     latest=$(latest_stable_release "$FIREBASE_REPO")
 fi
@@ -392,6 +478,18 @@ echo "======================================================================"
 echo "  Upstream (firebase-ios-sdk):  $latest"
 echo "  Current  (this repo):         $current"
 echo "======================================================================"
+
+# Inform when a newer upstream tag exists but lacks the Firebase.zip asset.
+# This happens for patch releases (e.g. 12.12.1, 11.8.1, 10.28.1) and is the
+# expected Firebase release policy — patches are source-only.
+if [[ -z "${FIREBASE_VERSION:-}" ]]; then
+    absolute_latest=$(upstream_absolute_latest)
+    if [[ -n "$absolute_latest" && "$absolute_latest" != "$latest" ]]; then
+        log "Note: $absolute_latest is the newest Firebase tag, but it has no"
+        log "      Firebase.zip asset. Firebase ships binaries only for minor"
+        log "      releases (X.Y.0); patches are source-only. Using $latest."
+    fi
+fi
 
 if [[ "$latest" == "$current" && -z "${debug:-}" ]]; then
     log "$current is up to date. Nothing to do."
@@ -410,7 +508,10 @@ create_scratch
     home="$OLDPWD"
 
     step 1 "Downloading Firebase $latest from Google..."
-    gh release download --pattern 'Firebase.zip' --repo "$FIREBASE_REPO" --clobber
+    # IMPORTANT: pin --tag to $latest. Without it, `gh release download` targets
+    # the newest release (which may be a patch with no Firebase.zip asset) and
+    # fails with "no assets to download".
+    gh release download "$latest" --pattern 'Firebase.zip' --repo "$FIREBASE_REPO" --clobber
 
     # Extract the Firebase.zip
     zip_file=$(find . -name "*.zip" -maxdepth 1 | head -1)
@@ -446,12 +547,40 @@ create_scratch
 
     step 5 "Generating & validating Package.swift (local)..."
     generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" "$XCFRAMEWORKS_REPO" "$distribution"
-    log "Validating local manifest..."
+    log "Validating local manifest (dump-package)..."
     (cd ..; swift package dump-package > /dev/null)
+    # Resolve+build against local binaries for the host platform (macOS). This
+    # validates the umbrella ObjC module compiles, binaryTarget paths resolve,
+    # platform conditions parse, and no target name collisions exist. Note
+    # that iOS-only binaryTargets are skipped by SPM on a macOS host build,
+    # so full cross-platform coverage requires a dedicated iOS-scheme build
+    # (out of scope for this script; consumers exercise that). Skip with
+    # FAST_VALIDATE=1 when only metadata changed.
+    if [[ "${FAST_VALIDATE:-0}" != "1" ]]; then
+        log "Building package against local binaries (swift build)..."
+        # NOTE: we're inside a `(subshell …)` block (see step 5 opening), not a
+        # function, so no `local` keyword — it would error out.
+        build_log=$(mktemp -t swift-build-XXXXXX)
+        if (cd ..; swift build) > "$build_log" 2>&1; then
+            log "swift build OK ($(wc -l < "$build_log" | tr -d ' ') lines of output suppressed)."
+            rm -f "$build_log"
+        else
+            warn "swift build FAILED — full output below:"
+            echo "────────────────────────────────────────────────────────────"
+            cat "$build_log"
+            echo "────────────────────────────────────────────────────────────"
+            rm -f "$build_log"
+            error "Generated Package.swift fails swift build against local binaries. \
+See output above. Common causes: corrupt xcframework download, upstream binary \
+layout change, or platform-condition mismatch."
+        fi
+    else
+        log "Skipping swift build (FAST_VALIDATE=1)."
+    fi
 
     step 6 "Generating & validating Package.swift (release)..."
     generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" "$XCFRAMEWORKS_REPO" ""
-    log "Validating release manifest..."
+    log "Validating release manifest (dump-package)..."
     (cd ..; swift package dump-package > /dev/null)
 )
 
