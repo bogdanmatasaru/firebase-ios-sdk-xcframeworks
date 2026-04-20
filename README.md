@@ -40,6 +40,18 @@ Then add only the products you need:
 
 > **Important:** Add `-ObjC` to Build Settings → Other Linker Flags.
 
+### Firebase Resource Bundles (Ads, Firestore TLS, etc.)
+
+Some Firebase frameworks ship resource bundles (`GoogleMobileAdsSDK.bundle`, `gRPCCertificates-Cpp.bundle`, privacy manifests, etc.) that **must land in your app's main bundle** at runtime. Because Swift Package Manager routes resources into a per-target bundle instead, they are `exclude:`d from `Package.swift` and a helper script copies them at build time.
+
+Add this as a **Run Script Phase** (Build Phases → + → New Run Script Phase) **after** "Copy Bundle Resources" and uncheck "Based on dependency analysis":
+
+```sh
+"${BUILD_DIR%Build/*}SourcePackages/checkouts/firebase-ios-sdk-xcframeworks/.scripts/resources.sh"
+```
+
+Without this script, ads do not load and Firestore TLS can fail. See [`.scripts/resources.sh`](.scripts/resources.sh) for details.
+
 ## Available Products
 
 All Firebase products from the official release are available:
@@ -77,6 +89,16 @@ A daily [GitHub Actions workflow](.github/workflows/package.yml):
 - **Manual:** Trigger from the Actions tab with an optional version override
 - **Concurrency safe:** Overlapping runs are automatically cancelled
 
+### Which Firebase Versions Get Mirrored?
+
+**Only minor releases (`X.Y.0`) are mirrored.** Firebase attaches the prebuilt `Firebase.zip` distribution **only to minor releases**. Patch releases (`X.Y.Z` with `Z > 0`, e.g. `12.12.1`, `11.8.1`, `10.28.1`) are source-only and cannot be mirrored as binaries.
+
+The packaging script automatically detects this: when the newest Firebase tag has no `Firebase.zip` asset, the script stays on the most recent minor release that does ship a zip, logs a note, and exits cleanly. The workflow resumes at the next minor release (e.g. `12.13.0`).
+
+If you need a patch release, either:
+- Use the source-based `firebase/firebase-ios-sdk` Swift Package directly (longer build times), or
+- Wait for the next minor release (usually 2–4 weeks).
+
 ## Running Locally
 
 ```bash
@@ -88,7 +110,10 @@ gh auth login
 cd .scripts && sh package.sh debug skip-release
 
 # Force a specific version
-FIREBASE_VERSION=12.9.0 sh package.sh debug skip-release
+FIREBASE_VERSION=12.12.0 sh package.sh debug skip-release
+
+# Skip `swift build` validation (fast mode — metadata-only)
+FAST_VALIDATE=1 sh package.sh debug skip-release
 ```
 
 ## Security
