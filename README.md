@@ -46,6 +46,9 @@ Some Firebase frameworks ship resource bundles (`GoogleMobileAdsSDK.bundle`, `gR
 
 Add this as a **Run Script Phase** (Build Phases → + → New Run Script Phase) **after** "Copy Bundle Resources" and uncheck "Based on dependency analysis":
 
+- **Shell:** `/bin/bash` (the script uses `shopt`, which POSIX `/bin/sh` does not implement)
+- **Script:**
+
 ```sh
 "${BUILD_DIR%Build/*}SourcePackages/checkouts/firebase-ios-sdk-xcframeworks/.scripts/resources.sh"
 ```

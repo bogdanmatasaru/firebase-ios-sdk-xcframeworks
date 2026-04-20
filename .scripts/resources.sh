@@ -20,7 +20,7 @@
 #
 # HOW TO USE (in your consumer Xcode project):
 #   - Target → Build Phases → + → New Run Script Phase
-#   - Shell: /bin/sh
+#   - Shell: /bin/bash   (REQUIRED — script uses `shopt`, a bash builtin)
 #   - Script:
 #       "${BUILD_DIR%Build/*}SourcePackages/checkouts/firebase-ios-sdk-xcframeworks/.scripts/resources.sh"
 #   - Make sure it runs AFTER "Copy Bundle Resources".
@@ -29,23 +29,43 @@
 # Reference: https://github.com/akaffenberger/firebase-ios-sdk-xcframeworks/issues/23
 # ══════════════════════════════════════════════════════════════════════════════
 
-set -eu
+# Strict mode: exit on unset var, command failure, OR any failure in a pipeline.
+# `pipefail` matters here because we fan out `cp` calls and aggregate via `wait`.
+set -euo pipefail
 
-# Directory of the main app bundle being built.
+# Directory of the main app bundle being built (provided by Xcode).
 BUILD_APP_DIR="${BUILT_PRODUCTS_DIR}/${FULL_PRODUCT_NAME}"
 
 # Resolve to the directory this script lives in (…/firebase-ios-sdk-xcframeworks/.scripts).
 cd "${0%/*}"
 
-# Skip the loop cleanly if no resources exist.
+# Skip the loop cleanly if no resources exist (bash builtin → /bin/sh will error).
 shopt -s nullglob
 
-copied=0
-for resource in ../Sources/*/Resources/*.*; do (
-    file=$(basename "$resource")
-    cp -R "$resource" "$BUILD_APP_DIR/$file"
-    echo "note: Firebase resources: copied $file → $BUILD_APP_DIR/"
-) & done
-wait
+# Capture PIDs so `wait <pid>` can propagate per-job exit codes. Plain `wait`
+# (no args) in bash returns 0 whenever *any* child succeeded, which would hide
+# a failed `cp`. Tracking PIDs gives us true fail-fast semantics.
+pids=()
+for resource in ../Sources/*/Resources/*.*; do
+    (
+        file=$(basename "$resource")
+        cp -R "$resource" "$BUILD_APP_DIR/$file"
+        echo "note: Firebase resources: copied $file → $BUILD_APP_DIR/"
+    ) &
+    pids+=("$!")
+done
 
-echo "note: Firebase resources: done."
+# Wait on each child individually; first failure aborts the whole script.
+# Guard against empty array: `"${pids[@]}"` with `set -u` errors on
+# pre-4.4 bash when the array has no elements, which is the common case when
+# the script runs against a build without any Firebase resources.
+if [[ "${#pids[@]}" -gt 0 ]]; then
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then
+            echo "error: Firebase resources: copy job (pid=$pid) failed" >&2
+            exit 1
+        fi
+    done
+fi
+
+echo "note: Firebase resources: done (${#pids[@]} file(s) copied)."
